@@ -1,0 +1,156 @@
+# Install dependencies and set up Selenium in Google Colab
+!pip install selenium
+!apt-get update
+!apt install -y chromium-chromedriver
+!cp /usr/lib/chromium-browser/chromedriver /usr/bin
+!pip install flask-ngrok
+
+# Import necessary libraries
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+import pandas as pd
+from bs4 import BeautifulSoup
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.model_selection import GridSearchCV
+import joblib
+from flask import Flask, request, jsonify
+from flask_ngrok import run_with_ngrok
+
+# Configure Chrome options
+chrome_options = Options()
+chrome_options.add_argument('--headless')
+chrome_options.add_argument('--no-sandbox')
+chrome_options.add_argument('--disable-dev-shm-usage')
+
+# Set up the Chrome driver service
+service = Service('/usr/bin/chromedriver')
+
+# Function to scrape data
+def scrape_data(url):
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+    driver.get(url)
+    driver.implicitly_wait(10)  # Wait for the page to load
+
+    soup = BeautifulSoup(driver.page_source, 'html.parser')
+    driver.quit()
+
+    table = soup.find('table', {'class': 'results-archive-table'})
+    if table is None:
+        print("Table not found")
+        return pd.DataFrame()
+
+    matches = []
+    for row in table.find_all('tr')[1:]:
+        cells = row.find_all('td')
+        match = {
+            'tournament': cells[0].text.strip(),
+            'date': cells[1].text.strip(),
+            'winner': cells[2].text.strip(),
+            'loser': cells[3].text.strip(),
+            'score': cells[4].text.strip()
+        }
+        matches.append(match)
+
+    return pd.DataFrame(matches)
+
+# List of years to scrape
+years = range(2020, 2024)
+all_matches = []
+
+for year in years:
+    specific_year_url = f'https://www.atptour.com/en/scores/results-archive?year={year}'
+    yearly_data = scrape_data(specific_year_url)
+    if not yearly_data.empty:
+        all_matches.append(yearly_data)
+
+df_all_matches = pd.concat(all_matches, ignore_index=True)
+df_all_matches.to_csv('all_tennis_matches.csv', index=False)
+
+# Data Preprocessing
+# Load the dataset
+df = pd.read_csv('all_tennis_matches.csv')
+
+# Handle missing values
+df = df.dropna()
+
+# Feature engineering: create new features
+# This is an example; you'll need actual player statistics for realistic features
+df['player1_win_rate'] = np.random.random(len(df))  # Placeholder for actual win rate
+df['player2_win_rate'] = np.random.random(len(df))  # Placeholder for actual win rate
+
+# Example encoding: assuming player1 won if their win rate is higher (for demonstration)
+df['player1_won'] = (df['player1_win_rate'] > df['player2_win_rate']).astype(int)
+
+# Select features and target variable
+features = ['player1_win_rate', 'player2_win_rate']
+target = 'player1_won'
+
+X = df[features]
+y = df[target]
+
+# Splitting the Data
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Model Selection and Training
+# Initialize and train the model
+model = RandomForestClassifier(n_estimators=100, random_state=42)
+model.fit(X_train, y_train)
+
+# Model Evaluation
+# Make predictions
+y_pred = model.predict(X_test)
+
+# Evaluate the model
+accuracy = accuracy_score(y_test, y_pred)
+print(f'Accuracy: {accuracy:.2f}')
+print(classification_report(y_test, y_pred))
+
+# Hyperparameter Tuning
+# Define the parameter grid
+param_grid = {
+    'n_estimators': [50, 100, 200],
+    'max_depth': [None, 10, 20, 30],
+    'min_samples_split': [2, 5, 10],
+    'min_samples_leaf': [1, 2, 4]
+}
+
+# Initialize GridSearchCV
+grid_search = GridSearchCV(estimator=model, param_grid=param_grid, cv=5, n_jobs=-1, verbose=2)
+grid_search.fit(X_train, y_train)
+
+# Get the best parameters
+best_params = grid_search.best_params_
+print(f'Best parameters: {best_params}')
+
+# Train the final model with the best parameters
+final_model = RandomForestClassifier(**best_params, random_state=42)
+final_model.fit(X_train, y_train)
+
+# Evaluate the final model
+y_final_pred = final_model.predict(X_test)
+final_accuracy = accuracy_score(y_test, y_final_pred)
+print(f'Final Accuracy: {final_accuracy:.2f}')
+
+# Saving the Model
+# Save the model to a file
+joblib.dump(final_model, 'tennis_prediction_model.pkl')
+
+# Deployment with Flask
+# Load the model
+model = joblib.load('tennis_prediction_model.pkl')
+
+app = Flask(__name__)
+run_with_ngrok(app)  # Starts ngrok when the app is run
+
+@app.route('/predict', methods=['POST'])
+def predict():
+    data = request.get_json(force=True)
+    prediction = model.predict([data['features']])
+    return jsonify({'prediction': int(prediction[0])})
+
+if __name__ == '__main__':
+    app.run()
