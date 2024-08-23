@@ -1,0 +1,203 @@
+import cv2
+import numpy as np
+from pytube import YouTube
+import tensorflow as tf
+from tensorflow.keras.layers import Dense, Reshape, Flatten, Input, Conv2D, UpSampling2D, BatchNormalization, Activation, Lambda
+from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras import backend as K
+from tensorflow.keras.losses import mse
+
+# Step 1: Download the YouTube Video
+def download_youtube_video(youtube_url, output_filename='tennis_match.mp4'):
+    yt = YouTube(youtube_url)
+    stream = yt.streams.get_highest_resolution()
+    stream.download(filename=output_filename)
+    print(f"Downloaded video saved as: {output_filename}")
+    return output_filename
+
+# Step 2: Load Video Using OpenCV
+def load_video(video_path):
+    cap = cv2.VideoCapture(video_path)
+    frames = []
+    
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        frames.append(frame)
+    
+    cap.release()
+    return np.array(frames)
+
+# Step 3: YOLO Model for Tennis Ball Detection
+def detect_ball(frame, yolo_model):
+    blob = cv2.dnn.blobFromImage(frame, 1/255.0, (416, 416), swapRB=True, crop=False)
+    yolo_model.setInput(blob)
+    detections = yolo_model.predict(blob)
+    
+    for detection in detections:
+        scores = detection[5:]
+        class_id = np.argmax(scores)
+        confidence = scores[class_id]
+        
+        if confidence > 0.5 and class_id == 0:  # Assuming class 0 is tennis ball
+            center_x, center_y, width, height = detection[0:4] * np.array([frame.shape[1], frame.shape[0], frame.shape[1], frame.shape[0]])
+            x = int(center_x - width / 2)
+            y = int(center_y - height / 2)
+            return (x, y, int(width), int(height))
+    return None
+
+def process_video_with_yolo(frames, yolo_model):
+    detected_frames = []
+    
+    for frame in frames:
+        ball_bbox = detect_ball(frame, yolo_model)
+        if ball_bbox:
+            x, y, w, h = ball_bbox
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        
+        detected_frames.append(frame)
+    
+    return detected_frames
+
+# Step 4: Build and Train a Simple GAN for Data Augmentation
+def build_generator():
+    model = Sequential()
+    model.add(Dense(128 * 8 * 8, input_dim=100))
+    model.add(Activation('relu'))
+    model.add(Reshape((8, 8, 128)))
+    model.add(UpSampling2D())
+    model.add(Conv2D(128, kernel_size=3, padding='same'))
+    model.add(BatchNormalization(momentum=0.8))
+    model.add(Activation('relu'))
+    model.add(UpSampling2D())
+    model.add(Conv2D(64, kernel_size=3, padding='same'))
+    model.add(BatchNormalization(momentum=0.8))
+    model.add(Activation('relu'))
+    model.add(Conv2D(1, kernel_size=3, padding='same'))
+    model.add(Activation('tanh'))
+    return model
+
+def build_discriminator():
+    model = Sequential()
+    model.add(Conv2D(64, kernel_size=3, strides=2, input_shape=(32, 32, 1), padding='same'))
+    model.add(Activation('relu'))
+    model.add(Flatten())
+    model.add(Dense(1, activation='sigmoid'))
+    return model
+
+def train_gan(generator, discriminator, X_train, epochs=10000, batch_size=32):
+    discriminator.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
+    discriminator.trainable = False
+
+    gan_input = Input(shape=(100,))
+    generated_img = generator(gan_input)
+    validity = discriminator(generated_img)
+
+    gan = Model(gan_input, validity)
+    gan.compile(loss='binary_crossentropy', optimizer='adam')
+
+    for epoch in range(epochs):
+        idx = np.random.randint(0, X_train.shape[0], batch_size)
+        real_imgs = X_train[idx]
+        noise = np.random.normal(0, 1, (batch_size, 100))
+        gen_imgs = generator.predict(noise)
+        
+        d_loss_real = discriminator.train_on_batch(real_imgs, np.ones((batch_size, 1)))
+        d_loss_fake = discriminator.train_on_batch(gen_imgs, np.zeros((batch_size, 1)))
+        
+        noise = np.random.normal(0, 1, (batch_size, 100))
+        g_loss = gan.train_on_batch(noise, np.ones((batch_size, 1)))
+        
+        if epoch % 1000 == 0:
+            print(f"{epoch}/{epochs} [D loss: {0.5 * np.add(d_loss_real, d_loss_fake)}] [G loss: {g_loss}]")
+
+# Step 5: VAE for Trajectory Prediction
+def sampling(args):
+    z_mean, z_log_var = args
+    batch = K.shape(z_mean)[0]
+    dim = K.int_shape(z_mean)[1]
+    epsilon = K.random_normal(shape=(batch, dim))
+    return z_mean + K.exp(0.5 * z_log_var) * epsilon
+
+def build_vae(input_dim, latent_dim):
+    inputs = Input(shape=(input_dim,))
+    h = Dense(128, activation='relu')(inputs)
+    
+    z_mean = Dense(latent_dim)(h)
+    z_log_var = Dense(latent_dim)(h)
+    
+    z = Lambda(sampling, output_shape=(latent_dim,))([z_mean, z_log_var])
+    
+    encoder = Model(inputs, [z_mean, z_log_var, z], name='encoder')
+    
+    latent_inputs = Input(shape=(latent_dim,), name='z_sampling')
+    x = Dense(128, activation='relu')(latent_inputs)
+    outputs = Dense(input_dim, activation='sigmoid')(x)
+    
+    decoder = Model(latent_inputs, outputs, name='decoder')
+    
+    outputs = decoder(encoder(inputs)[2])
+    vae = Model(inputs, outputs, name='vae_mlp')
+    
+    reconstruction_loss = mse(inputs, outputs)
+    reconstruction_loss *= input_dim
+    kl_loss = 1 + z_log_var - K.square(z_mean) - K.exp(z_log_var)
+    kl_loss = K.sum(kl_loss, axis=-1)
+    kl_loss *= -0.5
+    vae_loss = K.mean(reconstruction_loss + kl_loss)
+    
+    vae.add_loss(vae_loss)
+    vae.compile(optimizer='adam')
+    
+    return vae
+
+def predict_trajectory(vae_model, initial_conditions):
+    return vae_model.predict(initial_conditions)
+
+# Step 6: Visualization and Saving the Output Video
+def visualize_trajectory_on_video(frames, trajectories):
+    for i, frame in enumerate(frames):
+        if i < len(trajectories):
+            trajectory = trajectories[i]
+            for point in trajectory:
+                cv2.circle(frame, (int(point[0]), int(point[1])), 5, (0, 0, 255), -1)
+    
+    return frames
+
+# Example Usage: Download, Process, Augment, Predict, and Save the Video
+youtube_url = 'https://www.youtube.com/watch?v=0mqK08e4K6U'
+video_path = download_youtube_video(youtube_url)
+
+frames = load_video(video_path)
+
+# Load your pre-trained YOLO model here (replace with the actual model loading code)
+yolo_model = tf.keras.models.load_model('yolo_tennis_ball.h5')
+
+processed_frames = process_video_with_yolo(frames, yolo_model)
+
+# Example GAN training (you would need to train with actual tennis data)
+X_train = np.random.rand(1000, 32, 32, 1)  # Replace with actual tennis ball images
+generator = build_generator()
+discriminator = build_discriminator()
+train_gan(generator, discriminator, X_train)
+
+# Example VAE training and prediction (use actual trajectory data)
+vae = build_vae(input_dim=10, latent_dim=2)
+X_train = np.random.rand(1000, 10)  # Replace with actual trajectory data
+vae.fit(X_train, epochs=100, batch_size=32)
+
+predicted_trajectories = predict_video_trajectory(frames, vae)
+final_frames = visualize_trajectory_on_video(frames, predicted_trajectories)
+
+output_path_with_trajectory = 'output_video_with_trajectory.mp4'
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+out = cv2.VideoWriter(output_path_with_trajectory, fourcc, 20.0, (frames.shape[2], frames.shape[1]))
+
+for frame in final_frames:
+    out.write(frame)
+
+out.release()
+
+print("Processed video with trajectories saved as:", output_path_with_trajectory)
